@@ -17,9 +17,10 @@ from pptx import Presentation
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 EMBEDDING_MODEL = "gemini-embedding-2"
-ANSWER_MODEL = "gemini-3.7-flash"
+ANSWER_MODEL = "gemini-3.8-flash"
 EMBEDDING_DIMENSIONS = 768
 TIMEOUT = 300.0
+MAX_FILE_BYTES = 10 * 1024 * 1024
 
 allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [
@@ -36,7 +37,7 @@ if allowed_origins_env:
 app = FastAPI(
     title="DocMind AI API",
     description="Cloud-ready multilingual RAG powered by Gemini",
-    version="4.0.0",
+    version="4.1.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -46,18 +47,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DOCUMENTS = {}
-CHUNKS = []
+DOCUMENTS: dict[str, dict] = {}
+CHUNKS: list[dict] = []
+
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=2)
     document_ids: list[str] | None = None
     top_k: int = Field(default=5, ge=1, le=10)
 
+
 class SearchRequest(BaseModel):
     question: str = Field(min_length=2)
     document_ids: list[str] | None = None
     top_k: int = Field(default=5, ge=1, le=10)
+
 
 class SummaryRequest(BaseModel):
     document_ids: list[str] | None = None
@@ -70,6 +74,7 @@ def gemini_headers():
             status_code=503,
             detail="Gemini API key is not configured on the server.",
         )
+
     return {
         "Content-Type": "application/json",
         "x-goog-api-key": GEMINI_API_KEY,
@@ -85,36 +90,36 @@ def create_embeddings(texts: list[str], task: str = "document"):
         return []
 
     if task == "query":
-        prepared = [f"task: retrieval_query | query: {item}" for item in texts]
+        prepared = [f"task: retrieval_query | query: {text}" for text in texts]
     else:
-        prepared = [f"task: retrieval_document | document: {item}" for item in texts]
+        prepared = [f"task: retrieval_document | document: {text}" for text in texts]
 
-    result = []
+    vectors = []
+
     try:
         with httpx.Client(timeout=TIMEOUT) as client:
-            for i in range(0, len(prepared), 20):
-                batch = prepared[i:i + 20]
-                payload = {
-                    "requests": [
-                        {
-                            "model": f"models/{EMBEDDING_MODEL}",
-                            "content": {"parts": [{"text": item}]},
-                            "outputDimensionality": EMBEDDING_DIMENSIONS,
-                        }
-                        for item in batch
-                    ]
-                }
+            for text in prepared:
                 response = client.post(
-                    f"{GEMINI_BASE_URL}/models/{EMBEDDING_MODEL}:batchEmbedContents",
+                    f"{GEMINI_BASE_URL}/models/{EMBEDDING_MODEL}:embedContent",
                     headers=gemini_headers(),
-                    json=payload,
+                    json={
+                        "model": f"models/{EMBEDDING_MODEL}",
+                        "content": {
+                            "parts": [{"text": text}],
+                        },
+                        "output_dimensionality": EMBEDDING_DIMENSIONS,
+                    },
                 )
                 response.raise_for_status()
-                embeddings = response.json().get("embeddings", [])
-                if len(embeddings) != len(batch):
-                    raise RuntimeError("Unexpected embeddings response from Gemini")
-                result.extend(item["values"] for item in embeddings)
-        return result
+
+                embedding = response.json().get("embedding", {}).get("values", [])
+                if not embedding:
+                    raise RuntimeError("Gemini returned an empty embedding")
+
+                vectors.append(embedding)
+
+        return vectors
+
     except httpx.HTTPStatusError as error:
         print("Gemini embedding HTTP error:", error.response.text)
         raise HTTPException(
@@ -130,6 +135,7 @@ def create_embeddings(texts: list[str], task: str = "document"):
 
 def gemini_chat(system_prompt: str, user_prompt: str):
     full_prompt = f"{system_prompt}\n\n---\n\n{user_prompt}"
+
     try:
         with httpx.Client(timeout=TIMEOUT) as client:
             response = client.post(
@@ -144,20 +150,28 @@ def gemini_chat(system_prompt: str, user_prompt: str):
                     ],
                     "generationConfig": {
                         "temperature": 0.0,
-                        "maxOutputTokens": 2048,
+                        "maxOutputTokens": 1600,
+                        "thinkingConfig": {
+                            "thinkingLevel": "low"
+                        },
                     },
                 },
             )
             response.raise_for_status()
+
             data = response.json()
             candidates = data.get("candidates", [])
             if not candidates:
                 raise RuntimeError("Gemini returned no candidates")
+
             parts = candidates[0].get("content", {}).get("parts", [])
             answer = "".join(part.get("text", "") for part in parts).strip()
+
             if not answer:
                 raise RuntimeError("Gemini returned an empty answer")
+
             return answer
+
     except httpx.HTTPStatusError as error:
         print("Gemini chat HTTP error:", error.response.text)
         raise HTTPException(
@@ -174,94 +188,134 @@ def gemini_chat(system_prompt: str, user_prompt: str):
 def cosine_similarity(a, b):
     a = np.array(a, dtype=np.float32)
     b = np.array(b, dtype=np.float32)
-    den = np.linalg.norm(a) * np.linalg.norm(b)
-    return 0.0 if den == 0 else float(np.dot(a, b) / den)
+    denominator = np.linalg.norm(a) * np.linalg.norm(b)
+    return 0.0 if denominator == 0 else float(np.dot(a, b) / denominator)
 
 
 def extract_pdf(data: bytes):
     reader = PdfReader(BytesIO(data))
-    out = []
-    for n, page in enumerate(reader.pages, 1):
+    output = []
+
+    for page_number, page in enumerate(reader.pages, 1):
         text = (page.extract_text() or "").strip()
         if text:
-            out.append({"location": f"Page {n}", "location_number": n, "text": text})
-    return out
+            output.append(
+                {
+                    "location": f"Page {page_number}",
+                    "location_number": page_number,
+                    "text": text,
+                }
+            )
+
+    return output
 
 
 def extract_docx(data: bytes):
-    doc = Document(BytesIO(data))
-    out = []
-    n = 0
-    for p in doc.paragraphs:
-        text = p.text.strip()
+    document = Document(BytesIO(data))
+    output = []
+    paragraph_number = 0
+
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
         if text:
-            n += 1
-            out.append({"location": f"Paragraph {n}", "location_number": n, "text": text})
-    return out
+            paragraph_number += 1
+            output.append(
+                {
+                    "location": f"Paragraph {paragraph_number}",
+                    "location_number": paragraph_number,
+                    "text": text,
+                }
+            )
+
+    return output
 
 
 def extract_pptx(data: bytes):
-    prs = Presentation(BytesIO(data))
-    out = []
-    for n, slide in enumerate(prs.slides, 1):
+    presentation = Presentation(BytesIO(data))
+    output = []
+
+    for slide_number, slide in enumerate(presentation.slides, 1):
         parts = []
+
         for shape in slide.shapes:
             if hasattr(shape, "text"):
                 text = shape.text.strip()
                 if text:
                     parts.append(text)
+
         if parts:
-            out.append({"location": f"Slide {n}", "location_number": n, "text": "\n".join(parts)})
-    return out
+            output.append(
+                {
+                    "location": f"Slide {slide_number}",
+                    "location_number": slide_number,
+                    "text": "\n".join(parts),
+                }
+            )
+
+    return output
 
 
 def chunk_text(text: str, max_chars=1400, overlap=250):
     text = text.strip()
     if not text:
         return []
+
     if len(text) <= max_chars:
         return [text]
 
-    out = []
+    chunks = []
     start = 0
+
     while start < len(text):
         end = min(start + max_chars, len(text))
+
         if end < len(text):
             search_start = start + int(max_chars * 0.60)
             section = text[search_start:end]
-            breaks = [
-                section.rfind("\n"), section.rfind(". "), section.rfind("? "),
-                section.rfind("! "), section.rfind("، "), section.rfind("؟ ")
+            break_points = [
+                section.rfind("\n"),
+                section.rfind(". "),
+                section.rfind("? "),
+                section.rfind("! "),
+                section.rfind("، "),
+                section.rfind("؟ "),
             ]
-            best = max(breaks)
-            if best > 0:
-                end = search_start + best + 1
+            best_break = max(break_points)
+
+            if best_break > 0:
+                end = search_start + best_break + 1
 
         piece = text[start:end].strip()
         if piece:
-            out.append(piece)
+            chunks.append(piece)
+
         if end >= len(text):
             break
+
         start = max(end - overlap, start + 1)
-    return out
+
+    return chunks
 
 
 def create_document_chunks(document_id: str, filename: str, locations: list):
-    out = []
-    for loc in locations:
-        for piece_number, piece in enumerate(chunk_text(loc["text"]), 1):
-            out.append({
-                "id": str(uuid4()),
-                "document_id": document_id,
-                "filename": filename,
-                "location": loc["location"],
-                "location_number": loc["location_number"],
-                "piece_number": piece_number,
-                "text": piece,
-                "embedding": None,
-            })
-    return out
+    output = []
 
+    for location in locations:
+        for piece_number, piece in enumerate(chunk_text(location["text"]), 1):
+            output.append(
+                {
+                    "id": str(uuid4()),
+                    "document_id": document_id,
+                    "filename": filename,
+                    "location": location["location"],
+                    "location_number": location["location_number"],
+                    "piece_number": piece_number,
+                    "text": piece,
+                    "embedding": None,
+                }
+            )
+
+    return output
 
 
 FIELD_INTENTS = [
@@ -305,15 +359,13 @@ FIELD_INTENTS = [
 
 
 def field_intent_boost(question: str, text: str) -> float:
-    """Small lexical boost for explicit factual fields in Arabic/English."""
-    q = question.lower()
-    t = text.lower()
-
+    question_lower = question.lower()
+    text_lower = text.lower()
     best_boost = 0.0
 
     for intent in FIELD_INTENTS:
-        if any(term in q for term in intent["question_terms"]):
-            if any(term in t for term in intent["document_terms"]):
+        if any(term in question_lower for term in intent["question_terms"]):
+            if any(term in text_lower for term in intent["document_terms"]):
                 best_boost = max(best_boost, 0.22)
 
     return best_boost
@@ -323,23 +375,34 @@ def semantic_search(question: str, document_ids=None, top_k=5):
     if not CHUNKS:
         raise HTTPException(400, "No processed documents found. Upload documents first.")
 
-    candidates = CHUNKS
-    if document_ids:
-        candidates = [c for c in CHUNKS if c["document_id"] in document_ids]
+    if not document_ids:
+        raise HTTPException(400, "Select at least one uploaded document.")
+
+    candidates = [
+        chunk
+        for chunk in CHUNKS
+        if chunk["document_id"] in document_ids
+    ]
+
     if not candidates:
         raise HTTPException(404, "No chunks found for the selected documents.")
 
-    q = create_embeddings([question], task="query")[0]
+    query_embedding = create_embeddings([question], task="query")[0]
     results = []
+
     for chunk in candidates:
-        similarity = cosine_similarity(q, chunk["embedding"])
+        similarity = cosine_similarity(query_embedding, chunk["embedding"])
         lexical_boost = field_intent_boost(question, chunk["text"])
-        results.append({
-            **chunk,
-            "similarity": similarity,
-            "hybrid_score": similarity + lexical_boost,
-        })
-    results.sort(key=lambda x: x["hybrid_score"], reverse=True)
+
+        results.append(
+            {
+                **chunk,
+                "similarity": similarity,
+                "hybrid_score": similarity + lexical_boost,
+            }
+        )
+
+    results.sort(key=lambda item: item["hybrid_score"], reverse=True)
     return results[:top_k]
 
 
@@ -347,12 +410,10 @@ def semantic_search(question: str, document_ids=None, top_k=5):
 def root():
     return {
         "message": "DocMind AI API is running",
-        "version": "4.0.0",
+        "version": "4.1.0",
         "ai_provider": "Gemini API",
         "embedding_model": EMBEDDING_MODEL,
         "answer_model": ANSWER_MODEL,
-        "documents": len(DOCUMENTS),
-        "chunks": len(CHUNKS),
     }
 
 
@@ -363,14 +424,15 @@ def health():
         "gemini_configured": check_gemini(),
         "embedding_model": EMBEDDING_MODEL,
         "answer_model": ANSWER_MODEL,
-        "documents": len(DOCUMENTS),
-        "chunks": len(CHUNKS),
     }
 
 
 @app.post("/upload")
 async def upload_documents(
-    files: Annotated[list[UploadFile], File(description="Upload PDF, DOCX, or PPTX files")]
+    files: Annotated[
+        list[UploadFile],
+        File(description="Upload PDF, DOCX, or PPTX files"),
+    ]
 ):
     uploaded = []
 
@@ -378,20 +440,23 @@ async def upload_documents(
         if not file.filename:
             continue
 
-        ext = Path(file.filename).suffix.lower()
-        if ext not in [".pdf", ".docx", ".pptx"]:
-            raise HTTPException(400, f"Unsupported file type: {ext}")
+        extension = Path(file.filename).suffix.lower()
+        if extension not in [".pdf", ".docx", ".pptx"]:
+            raise HTTPException(400, f"Unsupported file type: {extension}")
 
         data = await file.read()
+        if len(data) > MAX_FILE_BYTES:
+            raise HTTPException(413, f"{file.filename} is larger than 10 MB.")
+
         try:
-            if ext == ".pdf":
+            if extension == ".pdf":
                 locations = extract_pdf(data)
-            elif ext == ".docx":
+            elif extension == ".docx":
                 locations = extract_docx(data)
             else:
                 locations = extract_pptx(data)
-        except Exception as e:
-            print("Extraction error:", file.filename, repr(e))
+        except Exception as error:
+            print("Extraction error:", file.filename, repr(error))
             raise HTTPException(400, f"Could not read {file.filename}")
 
         if not locations:
@@ -401,8 +466,16 @@ async def upload_documents(
             )
 
         document_id = str(uuid4())
-        document_chunks = create_document_chunks(document_id, file.filename, locations)
-        embeddings = create_embeddings([c["text"] for c in document_chunks])
+        document_chunks = create_document_chunks(
+            document_id,
+            file.filename,
+            locations,
+        )
+
+        embeddings = create_embeddings(
+            [chunk["text"] for chunk in document_chunks],
+            task="document",
+        )
 
         for chunk, embedding in zip(document_chunks, embeddings):
             chunk["embedding"] = embedding
@@ -410,112 +483,103 @@ async def upload_documents(
         DOCUMENTS[document_id] = {
             "id": document_id,
             "filename": file.filename,
-            "file_type": ext.replace(".", ""),
+            "file_type": extension.replace(".", ""),
             "locations": locations,
         }
         CHUNKS.extend(document_chunks)
 
-        uploaded.append({
-            "id": document_id,
-            "filename": file.filename,
-            "file_type": ext.replace(".", ""),
-            "locations_found": len(locations),
-            "characters_extracted": sum(len(x["text"]) for x in locations),
-            "chunks_created": len(document_chunks),
-            "preview": locations[0]["text"][:250],
-        })
+        uploaded.append(
+            {
+                "id": document_id,
+                "filename": file.filename,
+                "file_type": extension.replace(".", ""),
+                "locations_found": len(locations),
+                "characters_extracted": sum(
+                    len(location["text"])
+                    for location in locations
+                ),
+                "chunks_created": len(document_chunks),
+                "preview": locations[0]["text"][:250],
+            }
+        )
 
-    return {"success": True, "documents": uploaded, "total_chunks": len(CHUNKS)}
-
-
-@app.get("/documents")
-def get_documents():
-    return [
-        {
-            "id": d["id"],
-            "filename": d["filename"],
-            "file_type": d["file_type"],
-            "locations_found": len(d["locations"]),
-        }
-        for d in DOCUMENTS.values()
-    ]
-
-
-@app.get("/documents/{document_id}")
-def get_document(document_id: str):
-    doc = DOCUMENTS.get(document_id)
-    if not doc:
-        raise HTTPException(404, "Document not found")
-    return doc
+    return {
+        "success": True,
+        "documents": uploaded,
+    }
 
 
 @app.post("/search")
 def search_documents(request: SearchRequest):
-    results = semantic_search(request.question, request.document_ids, request.top_k)
+    results = semantic_search(
+        request.question,
+        request.document_ids,
+        request.top_k,
+    )
+
     return {
         "question": request.question,
         "results": [
             {
-                "document_id": r["document_id"],
-                "filename": r["filename"],
-                "location": r["location"],
-                "similarity": round(r["similarity"], 4),
-                "text": r["text"],
+                "document_id": result["document_id"],
+                "filename": result["filename"],
+                "location": result["location"],
+                "similarity": round(result["similarity"], 4),
+                "text": result["text"],
             }
-            for r in results
+            for result in results
         ],
     }
 
 
 @app.post("/ask")
 def ask_documents(request: AskRequest):
-    results = semantic_search(request.question, request.document_ids, request.top_k)
+    results = semantic_search(
+        request.question,
+        request.document_ids,
+        request.top_k,
+    )
 
     context_parts = []
     sources = []
-    seen = set()
 
-    for i, r in enumerate(results, 1):
+    for source_number, result in enumerate(results, 1):
         context_parts.append(
-            f'[SOURCE {i}]\nFile: {r["filename"]}\nLocation: {r["location"]}\n\n{r["text"]}'
+            f'[SOURCE {source_number}]\n'
+            f'File: {result["filename"]}\n'
+            f'Location: {result["location"]}\n\n'
+            f'{result["text"]}'
         )
-        key = (r["filename"], r["location"])
-        if key not in seen:
-            seen.add(key)
-            sources.append({
-                "source_number": i,
-                "document_id": r["document_id"],
-                "filename": r["filename"],
-                "location": r["location"],
-                "similarity": round(r["similarity"], 4),
-                "preview": r["text"][:300],
-            })
+
+        sources.append(
+            {
+                "source_number": source_number,
+                "document_id": result["document_id"],
+                "filename": result["filename"],
+                "location": result["location"],
+                "similarity": round(result["similarity"], 4),
+                "preview": result["text"][:300],
+            }
+        )
 
     system_prompt = """
 You are DocMind AI, a strict document-grounded assistant.
 
-NON-NEGOTIABLE RULES:
+RULES:
 1. Use ONLY facts explicitly written in the retrieved document context.
-2. Do NOT infer, guess, complete, or reinterpret missing facts.
-3. Before answering, locate direct textual evidence that answers the exact question.
-4. For exact factual fields such as a person's name, phone number, email, university,
-   nationality, date, ID, or location, COPY the exact value from the source text.
-   Do not alter names, numbers, spellings, initials, or email addresses.
-5. A project title or project description is NOT evidence for an unrelated personal fact.
-6. If no retrieved source directly states the requested fact, say that you could not
-   find this information in the uploaded documents.
-7. Answer in the same language as the user's question unless the user asks otherwise.
-8. The source may be in another language; translation is allowed, but exact names,
-   numbers, emails, and identifiers must stay exactly as written in the source.
-9. Cite every factual answer with [1], [2], etc.
-10. Cite ONLY sources that directly support the answer.
-11. Be concise for simple factual questions.
-
-Example behavior:
-Question: "ما هو الاسم؟"
-If a source explicitly shows "Ziyad Mohammed A Alghamdi", answer:
-"الاسم هو Ziyad Mohammed A Alghamdi. [1]"
-Do not invent an Arabic surname or change the spelling.
+2. Do not infer, guess, complete, or add outside knowledge.
+3. For names, phone numbers, emails, universities, nationality, dates, IDs,
+   and locations, copy the exact value from the source text.
+4. A project description is not evidence for an unrelated personal fact.
+5. If the requested information is not explicitly present, say that it was not
+   found in the uploaded documents and do not cite a source.
+6. Answer in the same language as the user's question unless asked otherwise.
+7. Translation is allowed, but exact names, numbers, emails, and identifiers
+   must remain exactly as written in the source.
+8. Cite factual answers with [1], [2], etc.
+9. Cite only sources that directly support the answer.
+10. Keep simple factual answers concise.
+11. Do not use Markdown bold, headings, or tables. Use plain text or simple lists.
 """.strip()
 
     user_prompt = f"""
@@ -530,17 +594,38 @@ Answer using only the context above.
 
     answer = gemini_chat(system_prompt, user_prompt)
 
-    # Return only sources actually cited by the model.
-    cited_numbers = {
-        int(number)
-        for number in re.findall(r"\[(\d+)\]", answer)
-    }
-
-    cited_sources = [
-        source
-        for source in sources
-        if source["source_number"] in cited_numbers
+    not_found_phrases = [
+        "لم أجد",
+        "غير موجود",
+        "غير مذكور",
+        "غير مذكورة",
+        "لا توجد معلومات",
+        "لا يوجد معلومات",
+        "could not find",
+        "couldn't find",
+        "not found",
+        "not mentioned",
+        "no information",
     ]
+
+    is_not_found = any(
+        phrase.lower() in answer.lower()
+        for phrase in not_found_phrases
+    )
+
+    if is_not_found:
+        answer = re.sub(r"\s*\[\d+\]", "", answer).strip()
+        cited_sources = []
+    else:
+        cited_numbers = {
+            int(number)
+            for number in re.findall(r"\[(\d+)\]", answer)
+        }
+        cited_sources = [
+            source
+            for source in sources
+            if source["source_number"] in cited_numbers
+        ]
 
     return {
         "question": request.question,
@@ -551,44 +636,66 @@ Answer using only the context above.
 
 @app.post("/summarize")
 def summarize_documents(request: SummaryRequest):
-    selected = list(DOCUMENTS.values())
-    if request.document_ids:
-        selected = [d for d in selected if d["id"] in request.document_ids]
+    if not request.document_ids:
+        raise HTTPException(400, "Select at least one uploaded document.")
+
+    selected = [
+        document
+        for document_id, document in DOCUMENTS.items()
+        if document_id in request.document_ids
+    ]
+
     if not selected:
         raise HTTPException(404, "No documents found to summarize.")
 
     parts = []
-    total = 0
-    max_chars = 80000
-    for d in selected:
-        parts.append(f'\n=== FILE: {d["filename"]} ===\n')
-        for loc in d["locations"]:
-            section = f'\n{loc["location"]}:\n{loc["text"]}\n'
-            if total + len(section) > max_chars:
+    total_characters = 0
+    max_characters = 70000
+
+    for document in selected:
+        parts.append(f'\n=== FILE: {document["filename"]} ===\n')
+
+        for location in document["locations"]:
+            section = (
+                f'\n{location["location"]}:\n'
+                f'{location["text"]}\n'
+            )
+
+            if total_characters + len(section) > max_characters:
                 break
+
             parts.append(section)
-            total += len(section)
-        if total >= max_chars:
+            total_characters += len(section)
+
+        if total_characters >= max_characters:
             break
 
-    lang = request.language.lower()
-    if lang == "arabic":
-        lang_instruction = "Write the summary in Arabic."
-    elif lang == "english":
-        lang_instruction = "Write the summary in English."
+    language = request.language.lower()
+
+    if language == "arabic":
+        language_instruction = "Write the summary in Arabic."
+    elif language == "english":
+        language_instruction = "Write the summary in English."
     else:
-        lang_instruction = "Write the summary in the main language of the documents."
+        language_instruction = "Write the summary in the main language of the documents."
 
     system_prompt = f"""
 You are DocMind AI.
 Summarize ONLY the supplied documents. Do not add outside knowledge.
-Create a clear structured summary with main ideas, important concepts, key facts,
-important definitions when present, and important conclusions when present.
-{lang_instruction}
+Create a clear structured summary with the main ideas, key facts,
+important definitions when present, and conclusions when present.
+{language_instruction}
 """.strip()
 
     summary = gemini_chat(system_prompt, "".join(parts))
+
     return {
         "summary": summary,
-        "documents": [{"id": d["id"], "filename": d["filename"]} for d in selected],
+        "documents": [
+            {
+                "id": document["id"],
+                "filename": document["filename"],
+            }
+            for document in selected
+        ],
     }
