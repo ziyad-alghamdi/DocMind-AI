@@ -1,4 +1,5 @@
 from io import BytesIO
+import os
 import re
 from pathlib import Path
 from typing import Annotated
@@ -13,19 +14,33 @@ from pypdf import PdfReader
 from docx import Document
 from pptx import Presentation
 
-OLLAMA_BASE_URL = "http://localhost:11434"
-EMBEDDING_MODEL = "bge-m3"
-ANSWER_MODEL = "qwen3:8b"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+EMBEDDING_MODEL = "gemini-embedding-2"
+ANSWER_MODEL = "gemini-3.7-flash"
+EMBEDDING_DIMENSIONS = 768
 TIMEOUT = 300.0
+
+allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+if allowed_origins_env:
+    ALLOWED_ORIGINS.extend(
+        origin.strip()
+        for origin in allowed_origins_env.split(",")
+        if origin.strip()
+    )
 
 app = FastAPI(
     title="DocMind AI API",
-    description="Free local multilingual RAG powered by Ollama",
-    version="3.1.0",
+    description="Cloud-ready multilingual RAG powered by Gemini",
+    version="4.0.0",
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -49,71 +64,111 @@ class SummaryRequest(BaseModel):
     language: str = "auto"
 
 
-def check_ollama():
-    try:
-        r = httpx.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10.0)
-        r.raise_for_status()
-        return True
-    except Exception:
-        return False
+def gemini_headers():
+    if not GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini API key is not configured on the server.",
+        )
+    return {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
 
 
-def create_embeddings(texts: list[str]):
+def check_gemini():
+    return bool(GEMINI_API_KEY)
+
+
+def create_embeddings(texts: list[str], task: str = "document"):
     if not texts:
         return []
+
+    if task == "query":
+        prepared = [f"task: retrieval_query | query: {item}" for item in texts]
+    else:
+        prepared = [f"task: retrieval_document | document: {item}" for item in texts]
 
     result = []
     try:
         with httpx.Client(timeout=TIMEOUT) as client:
-            for i in range(0, len(texts), 32):
-                batch = texts[i:i + 32]
-                r = client.post(
-                    f"{OLLAMA_BASE_URL}/api/embed",
-                    json={"model": EMBEDDING_MODEL, "input": batch},
+            for i in range(0, len(prepared), 20):
+                batch = prepared[i:i + 20]
+                payload = {
+                    "requests": [
+                        {
+                            "model": f"models/{EMBEDDING_MODEL}",
+                            "content": {"parts": [{"text": item}]},
+                            "outputDimensionality": EMBEDDING_DIMENSIONS,
+                        }
+                        for item in batch
+                    ]
+                }
+                response = client.post(
+                    f"{GEMINI_BASE_URL}/models/{EMBEDDING_MODEL}:batchEmbedContents",
+                    headers=gemini_headers(),
+                    json=payload,
                 )
-                r.raise_for_status()
-                embeddings = r.json().get("embeddings", [])
+                response.raise_for_status()
+                embeddings = response.json().get("embeddings", [])
                 if len(embeddings) != len(batch):
-                    raise RuntimeError("Unexpected embeddings response from Ollama")
-                result.extend(embeddings)
+                    raise RuntimeError("Unexpected embeddings response from Gemini")
+                result.extend(item["values"] for item in embeddings)
         return result
-    except httpx.ConnectError:
-        raise HTTPException(503, "Could not connect to Ollama. Make sure Ollama is running.")
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(502, f"Ollama embedding error: {e.response.text}")
-    except Exception as e:
-        print("Embedding error:", repr(e))
-        raise HTTPException(502, "Could not create embeddings with bge-m3.")
+    except httpx.HTTPStatusError as error:
+        print("Gemini embedding HTTP error:", error.response.text)
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini embedding request failed. Check the API key and free-tier quota.",
+        )
+    except HTTPException:
+        raise
+    except Exception as error:
+        print("Embedding error:", repr(error))
+        raise HTTPException(502, "Could not create document embeddings.")
 
 
-def ollama_chat(system_prompt: str, user_prompt: str):
+def gemini_chat(system_prompt: str, user_prompt: str):
+    full_prompt = f"{system_prompt}\n\n---\n\n{user_prompt}"
     try:
         with httpx.Client(timeout=TIMEOUT) as client:
-            r = client.post(
-                f"{OLLAMA_BASE_URL}/api/chat",
+            response = client.post(
+                f"{GEMINI_BASE_URL}/models/{ANSWER_MODEL}:generateContent",
+                headers=gemini_headers(),
                 json={
-                    "model": ANSWER_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
+                    "contents": [
+                        {
+                            "role": "user",
+                            "parts": [{"text": full_prompt}],
+                        }
                     ],
-                    "stream": False,
-                    "think": False,
-                    "options": {"temperature": 0.0},
+                    "generationConfig": {
+                        "temperature": 0.0,
+                        "maxOutputTokens": 2048,
+                    },
                 },
             )
-            r.raise_for_status()
-            answer = r.json().get("message", {}).get("content", "").strip()
+            response.raise_for_status()
+            data = response.json()
+            candidates = data.get("candidates", [])
+            if not candidates:
+                raise RuntimeError("Gemini returned no candidates")
+            parts = candidates[0].get("content", {}).get("parts", [])
+            answer = "".join(part.get("text", "") for part in parts).strip()
             if not answer:
-                raise RuntimeError("Empty response from Ollama")
+                raise RuntimeError("Gemini returned an empty answer")
             return answer
-    except httpx.ConnectError:
-        raise HTTPException(503, "Could not connect to Ollama. Make sure Ollama is running.")
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(502, f"Ollama chat error: {e.response.text}")
-    except Exception as e:
-        print("Chat error:", repr(e))
-        raise HTTPException(502, "Could not generate an answer with qwen3:8b.")
+    except httpx.HTTPStatusError as error:
+        print("Gemini chat HTTP error:", error.response.text)
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini answer request failed. Check the API key and free-tier quota.",
+        )
+    except HTTPException:
+        raise
+    except Exception as error:
+        print("Chat error:", repr(error))
+        raise HTTPException(502, "Could not generate an AI answer.")
 
 
 def cosine_similarity(a, b):
@@ -274,20 +329,26 @@ def semantic_search(question: str, document_ids=None, top_k=5):
     if not candidates:
         raise HTTPException(404, "No chunks found for the selected documents.")
 
-    q = create_embeddings([question])[0]
+    q = create_embeddings([question], task="query")[0]
     results = []
     for chunk in candidates:
-        results.append({**chunk, "similarity": cosine_similarity(q, chunk["embedding"])})
-    results.sort(key=lambda x: x["similarity"], reverse=True)
+        similarity = cosine_similarity(q, chunk["embedding"])
+        lexical_boost = field_intent_boost(question, chunk["text"])
+        results.append({
+            **chunk,
+            "similarity": similarity,
+            "hybrid_score": similarity + lexical_boost,
+        })
+    results.sort(key=lambda x: x["hybrid_score"], reverse=True)
     return results[:top_k]
 
 
 @app.get("/")
 def root():
     return {
-        "message": "DocMind AI API is running locally",
-        "version": "3.1.0",
-        "ai_provider": "Ollama",
+        "message": "DocMind AI API is running",
+        "version": "4.0.0",
+        "ai_provider": "Gemini API",
         "embedding_model": EMBEDDING_MODEL,
         "answer_model": ANSWER_MODEL,
         "documents": len(DOCUMENTS),
@@ -299,7 +360,7 @@ def root():
 def health():
     return {
         "status": "healthy",
-        "ollama_connected": check_ollama(),
+        "gemini_configured": check_gemini(),
         "embedding_model": EMBEDDING_MODEL,
         "answer_model": ANSWER_MODEL,
         "documents": len(DOCUMENTS),
@@ -467,7 +528,7 @@ RETRIEVED DOCUMENT CONTEXT:
 Answer using only the context above.
 """.strip()
 
-    answer = ollama_chat(system_prompt, user_prompt)
+    answer = gemini_chat(system_prompt, user_prompt)
 
     # Return only sources actually cited by the model.
     cited_numbers = {
@@ -526,7 +587,7 @@ important definitions when present, and important conclusions when present.
 {lang_instruction}
 """.strip()
 
-    summary = ollama_chat(system_prompt, "".join(parts))
+    summary = gemini_chat(system_prompt, "".join(parts))
     return {
         "summary": summary,
         "documents": [{"id": d["id"], "filename": d["filename"]} for d in selected],

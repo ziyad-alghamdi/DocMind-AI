@@ -2,6 +2,8 @@
 
 import { useRef, useState } from "react";
 
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
 type UploadedDocument = {
   id: string;
   filename: string;
@@ -31,7 +33,7 @@ export default function Home() {
     en: {
       chatDocuments: "Chat with your documents",
       languageButton: "العربية",
-      powered: "Powered locally by Ollama",
+      powered: "Powered by Gemini",
       badge: "AI-powered document assistant",
       title1: "Understand your documents",
       title2: "without reading them all.",
@@ -94,7 +96,7 @@ export default function Home() {
     ar: {
       chatDocuments: "تحدث مع ملفاتك",
       languageButton: "English",
-      powered: "يعمل محليًا باستخدام Ollama",
+      powered: "مدعوم بواسطة Gemini",
       badge: "مساعد ذكي لفهم المستندات",
       title1: "افهم ملفاتك",
       title2: "بدون الحاجة لقراءتها كلها.",
@@ -228,7 +230,7 @@ export default function Home() {
         formData.append("files", file);
       });
 
-      const response = await fetch("http://localhost:8000/upload", {
+      const response = await fetch(`${API_BASE_URL}/upload`, {
         method: "POST",
         body: formData,
       });
@@ -263,7 +265,7 @@ export default function Home() {
     setSources([]);
 
     try {
-      const response = await fetch("http://localhost:8000/ask", {
+      const response = await fetch(`${API_BASE_URL}/ask`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
