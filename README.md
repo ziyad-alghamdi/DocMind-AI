@@ -1,3 +1,7 @@
+<p align="center">
+  <strong>English</strong> | <a href="README_AR.md">العربية</a>
+</p>
+
 # DocMind AI
 
 DocMind AI is a multilingual AI-powered document assistant that helps users understand large amounts of information without reading every file manually.
